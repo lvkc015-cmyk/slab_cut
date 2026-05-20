@@ -151,6 +151,8 @@ def learned_candidate_selection(
 
     # 生成一个状态特征的缓存字典，供后续模型使用
     cache = state_cache(candidates, state)
+    ranking_feature_names = payload.get("ranking_feature_names", POLICY_FEATURE_NAMES)
+    stopping_feature_names = payload.get("stopping_feature_names", STOPPING_FEATURE_NAMES)
     # 从 payload 中读取多样性阈值和最大预算比例，
     diversity = float(payload["diversity_threshold"])
     max_ratio = float(payload["max_budget_ratio"])
@@ -160,7 +162,7 @@ def learned_candidate_selection(
     ranked_features: list[tuple[Any, float, dict[str, float]]] = []
     for cand in viable:
         # 计算该割的特征向量，
-        features = candidate_feature_vector(
+        full_features = candidate_feature_vector(
             cand,
             candidates,
             state,
@@ -170,13 +172,15 @@ def learned_candidate_selection(
             max_iters=state.max_iters,
             cached_state_features=cache,
         )
+        full_feature_map = {
+            name: value
+            for name, value in zip(POLICY_FEATURE_NAMES, full_features)
+        }
+        features = [float(full_feature_map[name]) for name in ranking_feature_names]
         # 使用 payload 中的模型对该割进行评分，得到一个分数 score
         score = model_score_one(payload["candidate_model"], features)
         # 将割、分数和特征映射组成一个元组，添加到 ranked_features 列表中。特征映射是一个字典，将特征名称与对应的特征值进行关联，供后续分析使用。
-        feature_map = {
-            name: value
-            for name, value in zip(payload["ranking_feature_names"], features)
-        }
+        feature_map = dict(full_feature_map)
         ranked_features.append((cand, score, feature_map))
     ranked_features.sort(key=lambda item: item[1], reverse=True)
     ranked_scores = [(cand, score) for cand, score, _feat in ranked_features]
@@ -208,7 +212,7 @@ def learned_candidate_selection(
             next_score=next_score,
             top_score=top_score,
         )
-        stop_vec = [float(stop_features[name]) for name in payload["stopping_feature_names"]]
+        stop_vec = [float(stop_features[name]) for name in stopping_feature_names]
         if stopping_constant is not None:
             stop_probability = float(stopping_constant)
         elif stopping_model is not None and hasattr(stopping_model, "predict_proba"):
@@ -257,4 +261,3 @@ def decision_summary(selected: list[Any], ranked_scores: list[tuple[Any, float]]
         mean_score=sum(values) / max(1, len(values)),
         min_score=min(values),
     )
-

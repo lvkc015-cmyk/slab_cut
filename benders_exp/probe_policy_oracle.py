@@ -9,7 +9,7 @@ from joblib import load
 
 from .benders import BendersCut
 from .network import add_instance_generator_args, generate_network_design_instance, instance_generator_kwargs_from_args
-from .network_benders_scip import NetworkScipBendersSolver
+from .network_benders_scip import NetworkScipBendersSolver, route1_all_open_feasibility_check
 from .policy_actions import default_continuation_selector, learned_candidate_selection, probe_score_fields
 from .strategies import SelectionState, SlabLikeStrategy, dot
 from .teacher import evaluate_prefix_rollouts, rollout_return
@@ -50,6 +50,16 @@ def main() -> None:
         seed=args.seed,
         **instance_kwargs,
     )
+    precheck_ok, precheck_reason = route1_all_open_feasibility_check(
+        instance,
+        time_limit=args.scip_time_limit if args.scip_time_limit > 0 else None,
+        threads=args.threads,
+    )
+    if not precheck_ok:
+        raise RuntimeError(
+            "route-1 probe requires an instance with a feasible all-open design; "
+            + precheck_reason
+        )
     solver = NetworkScipBendersSolver(
         instance=instance,
         strategy=SlabLikeStrategy(),

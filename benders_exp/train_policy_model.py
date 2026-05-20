@@ -17,6 +17,12 @@ def read_dataset(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(fh))
 
 
+def signed_log1p(value: float) -> float:
+    if value >= 0.0:
+        return math.log1p(value)
+    return -math.log1p(-value)
+
+
 def clean_float(value: str, limit: float = 1.0e6) -> float:
     raw = float(value)
     if not math.isfinite(raw):
@@ -24,6 +30,15 @@ def clean_float(value: str, limit: float = 1.0e6) -> float:
     if abs(raw) > limit:
         raise ValueError(f"feature magnitude exceeds limit {limit}: {raw}")
     return raw
+
+
+def nonconstant_feature_names(rows: list[dict[str, str]], names: list[str]) -> list[str]:
+    kept: list[str] = []
+    for name in names:
+        values = [clean_float(row[name]) for row in rows]
+        if max(values) != min(values):
+            kept.append(name)
+    return kept
 
 
 def main() -> None:
@@ -38,15 +53,19 @@ def main() -> None:
     if not rows:
         raise ValueError(f"empty dataset: {args.dataset}")
 
+    ranking_feature_names = nonconstant_feature_names(rows, POLICY_FEATURE_NAMES)
+    if not ranking_feature_names:
+        raise ValueError("all ranking features are constant on the dataset")
+
     rank_x: list[list[float]] = []
     rank_y: list[float] = []
     for row_idx, row in enumerate(rows):
         try:
-            rank_x.append([clean_float(row[name]) for name in POLICY_FEATURE_NAMES])
-            rank_y.append(clean_float(row.get("target_return", "0.0")))
+            rank_x.append([clean_float(row[name]) for name in ranking_feature_names])
+            rank_y.append(signed_log1p(clean_float(row.get("target_return", "0.0"))))
         except ValueError as exc:
             bad_columns = []
-            for name in POLICY_FEATURE_NAMES:
+            for name in ranking_feature_names:
                 try:
                     clean_float(row[name])
                 except ValueError:
@@ -59,15 +78,20 @@ def main() -> None:
         for row_idx, row in enumerate(rows)
         if int(float(row.get("use_for_stopping", "1"))) > 0
     ]
+    if not stopping_rows:
+        raise ValueError("no stopping rows with use_for_stopping=1 in dataset")
+    stopping_feature_names = nonconstant_feature_names([row for _row_idx, row in stopping_rows], STOPPING_FEATURE_NAMES)
+    if not stopping_feature_names:
+        raise ValueError("all stopping features are constant on the stopping subset")
     stopping_x = []
     stopping_y = []
     for row_idx, row in stopping_rows:
         try:
-            stopping_x.append([clean_float(row[name]) for name in STOPPING_FEATURE_NAMES])
+            stopping_x.append([clean_float(row[name]) for name in stopping_feature_names])
             stopping_y.append(1 if int(float(row.get("stop_target", 0.0))) > 0 else 0)
         except ValueError as exc:
             bad_columns = []
-            for name in STOPPING_FEATURE_NAMES:
+            for name in stopping_feature_names:
                 try:
                     clean_float(row[name])
                 except ValueError:
@@ -98,9 +122,9 @@ def main() -> None:
         stopping_model.fit(stopping_x, stopping_y)
     payload = {
         "selection_mode": "ranking_stopping",
-        "ranking_feature_names": POLICY_FEATURE_NAMES,
+        "ranking_feature_names": ranking_feature_names,
         "ranking_model": ranking_model,
-        "stopping_feature_names": STOPPING_FEATURE_NAMES,
+        "stopping_feature_names": stopping_feature_names,
         "stopping_model": stopping_model,
         "stopping_constant": stopping_constant,
         "candidate_model": ranking_model,

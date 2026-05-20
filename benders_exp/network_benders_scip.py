@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from pyscipopt import Model, quicksum
+from pyscipopt import Model, SCIP_PARAMSETTING, quicksum
 
 from .benders import BendersCut, BendersResult, FeasibilityCut, MasterSolution
 from .network import NetworkDesignInstance, NetworkScenario
@@ -16,8 +16,6 @@ from .strategies import CutCandidate, CutSelectionStrategy, SelectionState, dot
 
 
 EPS = 1.0e-8
-UNMET_DEMAND_PENALTY = 1.0e6
-OVERFLOW_PENALTY = 1.0e6
 
 
 @dataclass(frozen=True)
@@ -74,6 +72,28 @@ def all_commodities_connected(
     return disconnected_component_cut(instance, x, scenario) is None
 
 
+def route1_all_open_feasibility_check(
+    instance: NetworkDesignInstance,
+    *,
+    time_limit: float | None = None,
+    threads: int = 1,
+) -> tuple[bool, str]:
+    all_open = [1] * instance.n_edges
+    for s, scenario in enumerate(instance.scenarios):
+        if not all_commodities_connected(instance, all_open, scenario):
+            return False, f"scenario={s} disconnected under all-open design"
+        phase1 = solve_network_phase1_scip(
+            instance,
+            scenario,
+            all_open,
+            time_limit=time_limit,
+            threads=threads,
+        )
+        if not phase1.feasible:
+            return False, f"scenario={s} phase1 objective={phase1.objective:.12g} under all-open design"
+    return True, ""
+
+
 @dataclass(frozen=True)
 class NetworkSubproblemResult:
     feasible: bool
@@ -97,29 +117,23 @@ class PenaltyStats:
     expected_penalty_cost: float
 
 
-def solve_network_dual_scip(
+def _build_network_recourse_model(
     instance: NetworkDesignInstance,
     scenario: NetworkScenario,
     x: list[int],
     *,
+    name: str,
     time_limit: float | None = None,
     threads: int = 1,
-) -> NetworkSubproblemResult:
-    """Solve a penalty-augmented recourse LP for a fixed network design.
-
-    The subproblem is made always-feasible by adding:
-      - unmet-demand variables for each commodity
-      - edge-overflow variables for each undirected capacity constraint
-
-    Large penalties on these artificial variables replace feasibility cuts
-    with steep optimality cuts.
-    """
-
-    start = time.perf_counter()
-    model = Model("network_recourse")
+) -> tuple[Model, dict[tuple[int, int], object], dict[tuple[int, int], object], list, list, list]:
+    model = Model(name)
     configure_scip(model, time_limit=time_limit, threads=threads)
-
-    # 🔥 新增下面这一行：关闭子问题的预处理，确保所有约束在求解后依然完好保留，以便提取对偶解
+    # Official PySCIPOpt guidance for reliable dual extraction:
+    # disable presolving, heuristics, and propagation so the LP solver
+    # works on the unmodified problem.
+    model.setPresolve(SCIP_PARAMSETTING.OFF)
+    model.setHeuristics(SCIP_PARAMSETTING.OFF)
+    model.disablePropagation()
     model.setParam("presolving/maxrounds", 0)
 
     flow_forward: dict[tuple[int, int], object] = {}
@@ -136,7 +150,6 @@ def solve_network_dual_scip(
     for k, _commodity in enumerate(scenario.commodities):
         unmet.append(model.addVar(lb=0.0, vtype="C", name=f"unmet_{k}"))
 
-    balance_cons = []
     for k, commodity in enumerate(scenario.commodities):
         for node in range(instance.n_nodes):
             expr = quicksum(flow_forward[(e, k)] for e, (u, _v) in enumerate(instance.edges) if u == node)
@@ -144,12 +157,11 @@ def solve_network_dual_scip(
             expr -= quicksum(flow_backward[(e, k)] for e, (u, _v) in enumerate(instance.edges) if u == node)
             expr -= quicksum(flow_forward[(e, k)] for e, (_u, v) in enumerate(instance.edges) if v == node)
             if node == commodity.source:
-                cons = model.addCons(expr + unmet[k] == commodity.demand, name=f"bal_src_{k}_{node}")
+                model.addCons(expr + unmet[k] == commodity.demand, name=f"bal_src_{k}_{node}")
             elif node == commodity.sink:
-                cons = model.addCons(expr - unmet[k] == -commodity.demand, name=f"bal_sink_{k}_{node}")
+                model.addCons(expr - unmet[k] == -commodity.demand, name=f"bal_sink_{k}_{node}")
             else:
-                cons = model.addCons(expr == 0.0, name=f"bal_mid_{k}_{node}")
-            balance_cons.append(cons)
+                model.addCons(expr == 0.0, name=f"bal_mid_{k}_{node}")
 
     capacity_cons = []
     for e, (_u, _v) in enumerate(instance.edges):
@@ -158,20 +170,91 @@ def solve_network_dual_scip(
         cons = model.addCons(usage - overflow[e] <= rhs, name=f"cap_{e}")
         capacity_cons.append(cons)
 
-    objective = quicksum(
-        scenario.flow_costs[e] * (flow_forward[(e, k)] + flow_backward[(e, k)])
-        for e in range(instance.n_edges)
-        for k, _commodity in enumerate(scenario.commodities)
+    return model, flow_forward, flow_backward, unmet, overflow, capacity_cons
+
+
+def solve_network_phase1_scip(
+    instance: NetworkDesignInstance,
+    scenario: NetworkScenario,
+    x: list[int],
+    *,
+    time_limit: float | None = None,
+    threads: int = 1,
+) -> NetworkSubproblemResult:
+    start = time.perf_counter()
+    model, _ff, _fb, unmet, overflow, capacity_cons = _build_network_recourse_model(
+        instance,
+        scenario,
+        x,
+        name="network_recourse_phase1",
+        time_limit=time_limit,
+        threads=threads,
     )
-    objective += UNMET_DEMAND_PENALTY * quicksum(unmet)
-    objective += OVERFLOW_PENALTY * quicksum(overflow)
-    model.setObjective(objective, sense="minimize")
+    model.setObjective(quicksum(unmet) + quicksum(overflow), sense="minimize")
     model.optimize()
     status = str(model.getStatus()).lower()
     if status != "optimal":
         return NetworkSubproblemResult(False, math.inf, 0.0, [], time.perf_counter() - start)
 
     cap_duals = [float(model.getDualsolLinear(cons)) for cons in capacity_cons]
+    coeffs = [instance.capacities[e] * cap_duals[e] for e in range(instance.n_edges)]
+    obj = float(model.getObjVal())
+    const = obj - dot(coeffs, [float(v) for v in x])
+    unmet_total = sum(float(model.getVal(var)) for var in unmet)
+    overflow_total = sum(float(model.getVal(var)) for var in overflow)
+    return NetworkSubproblemResult(
+        feasible=obj <= 1.0e-7,
+        objective=obj,
+        const=const,
+        coeffs=coeffs,
+        solve_time=time.perf_counter() - start,
+        unmet_demand=unmet_total,
+        overflow=overflow_total,
+    )
+
+
+def solve_network_phase2_scip(
+    instance: NetworkDesignInstance,
+    scenario: NetworkScenario,
+    x: list[int],
+    *,
+    time_limit: float | None = None,
+    threads: int = 1,
+) -> NetworkSubproblemResult:
+    start = time.perf_counter()
+    model, flow_forward, flow_backward, unmet, overflow, capacity_cons = _build_network_recourse_model(
+        instance,
+        scenario,
+        x,
+        name="network_recourse_phase2",
+        time_limit=time_limit,
+        threads=threads,
+    )
+    for k, var in enumerate(unmet):
+        model.addCons(var == 0.0, name=f"fix_unmet_{k}")
+    for e, var in enumerate(overflow):
+        model.addCons(var == 0.0, name=f"fix_overflow_{e}")
+    objective = quicksum(
+        scenario.flow_costs[e] * (flow_forward[(e, k)] + flow_backward[(e, k)])
+        for e in range(instance.n_edges)
+        for k, _commodity in enumerate(scenario.commodities)
+    )
+    model.setObjective(objective, sense="minimize")
+    model.optimize()
+    status = str(model.getStatus()).lower()
+    if status != "optimal":
+        return NetworkSubproblemResult(False, math.inf, 0.0, [], time.perf_counter() - start)
+
+    by_name = {cons.name: cons for cons in model.getConss()}
+    resolved_capacity_cons = []
+    for e, cons in enumerate(capacity_cons):
+        cons_name = f"cap_{e}"
+        if cons_name in by_name:
+            resolved_capacity_cons.append(by_name[cons_name])
+        else:
+            raise RuntimeError(f"phase2 missing transformed capacity constraint {cons_name}")
+
+    cap_duals = [float(model.getDualsolLinear(cons)) for cons in resolved_capacity_cons]
     coeffs = [instance.capacities[e] * cap_duals[e] for e in range(instance.n_edges)]
     obj = float(model.getObjVal())
     const = obj - dot(coeffs, [float(v) for v in x])
@@ -185,6 +268,24 @@ def solve_network_dual_scip(
         solve_time=time.perf_counter() - start,
         unmet_demand=unmet_total,
         overflow=overflow_total,
+    )
+
+
+def solve_network_dual_scip(
+    instance: NetworkDesignInstance,
+    scenario: NetworkScenario,
+    x: list[int],
+    *,
+    time_limit: float | None = None,
+    threads: int = 1,
+) -> NetworkSubproblemResult:
+    """Backward-compatible wrapper for the phase-2 optimality LP."""
+    return solve_network_phase2_scip(
+        instance,
+        scenario,
+        x,
+        time_limit=time_limit,
+        threads=threads,
     )
 
 
@@ -435,7 +536,31 @@ class NetworkScipBendersSolver:
                 scenario_total_demand = sum(comm.demand for comm in scenario.commodities)
                 expected_total_demand += scenario.probability * scenario_total_demand
                 expected_unmet_demand += scenario.probability * scenario_total_demand
-                expected_penalty_cost += scenario.probability * UNMET_DEMAND_PENALTY * scenario_total_demand
+                expected_penalty_cost += scenario.probability * scenario_total_demand
+                continue
+            phase1 = solve_network_phase1_scip(
+                self.instance,
+                scenario,
+                master.x,
+                time_limit=self.scip_time_limit,
+                threads=self.threads,
+            )
+            subproblem_time += phase1.solve_time
+            scenario_total_demand = sum(comm.demand for comm in scenario.commodities)
+            expected_total_demand += scenario.probability * scenario_total_demand
+            expected_unmet_demand += scenario.probability * phase1.unmet_demand
+            expected_overflow += scenario.probability * phase1.overflow
+            expected_penalty_cost += scenario.probability * phase1.objective
+            if phase1.objective > EPS:
+                penalized_scenarios += 1
+                capacity_cut = FeasibilityCut(coeffs=[-value for value in phase1.coeffs], rhs=phase1.const)
+                key = (
+                    round(capacity_cut.rhs, 12),
+                    tuple(round(value, 12) for value in capacity_cut.coeffs),
+                )
+                if key not in seen_feasibility_keys:
+                    self.feasibility_cuts.append(capacity_cut)
+                    seen_feasibility_keys.add(key)
                 continue
             result = solve_network_dual_scip(
                 self.instance,
@@ -446,15 +571,7 @@ class NetworkScipBendersSolver:
             )
             subproblem_time += result.solve_time
             if not result.feasible:
-                raise RuntimeError(f"penalty subproblem failed for scenario {s}")
-            scenario_total_demand = sum(comm.demand for comm in scenario.commodities)
-            expected_total_demand += scenario.probability * scenario_total_demand
-            penalty_cost = UNMET_DEMAND_PENALTY * result.unmet_demand + OVERFLOW_PENALTY * result.overflow
-            expected_unmet_demand += scenario.probability * result.unmet_demand
-            expected_overflow += scenario.probability * result.overflow
-            expected_penalty_cost += scenario.probability * penalty_cost
-            if result.unmet_demand > EPS or result.overflow > EPS:
-                penalized_scenarios += 1
+                raise RuntimeError(f"phase-2 recourse LP failed for scenario {s}")
             expected_recourse += scenario.probability * result.objective
             value = result.const + dot(result.coeffs, [float(v) for v in master.x])
             candidates.append(
@@ -480,7 +597,7 @@ class NetworkScipBendersSolver:
             expected_overflow=expected_overflow,
             expected_penalty_cost=expected_penalty_cost,
         )
-        feasible = disconnected_scenarios == 0
+        feasible = disconnected_scenarios == 0 and penalized_scenarios == 0
         return feasible, expected_recourse, candidates, penalty_stats, subproblem_time
 
     def active_cuts_by_scenario(self) -> dict[int, list[list[float]]]:
