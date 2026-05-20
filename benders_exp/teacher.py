@@ -11,6 +11,7 @@ from .strategies import SelectionState
 
 TIME_SCALE_FLOOR = 5.0e-2
 MASTER_TIME_SCALE_FLOOR = 5.0e-2
+GAIN_SQUASH_THRESHOLD = 2.5e-1
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,13 @@ class RolloutScore:
 
 def _stable_log_ratio(value: float, scale: float) -> float:
     return math.log1p(max(0.0, value) / max(scale, 1.0e-6))
+
+
+def _squash_gain_ratio(ratio: float, threshold: float = GAIN_SQUASH_THRESHOLD) -> float:
+    capped_ratio = max(0.0, ratio)
+    if capped_ratio <= threshold:
+        return capped_ratio
+    return threshold + threshold * math.log(capped_ratio / threshold)
 
 
 def _baseline_scales(
@@ -113,7 +121,8 @@ def _rollout_core(
         cumulative_penalty_cost_ratio += discount * penalty_stats.penalty_cost_ratio
 
         lower_bound = master.objective
-        cumulative += discount * max(0.0, lower_bound - prev_lb) / gain_scale
+        gain_ratio = max(0.0, lower_bound - prev_lb) / gain_scale
+        cumulative += discount * _squash_gain_ratio(gain_ratio)
         prev_lb = lower_bound
 
         current_pressure = len(trial.optimality_cuts) / max(1, trial.instance.n_edges * trial.instance.n_scenarios)
