@@ -42,7 +42,8 @@ def collect_for_seed(
     instance_kwargs: dict[str, float | int | str],
 ) -> dict[str, int]: 
 
-    
+    effective_rollout_horizon = max(2, rollout_horizon)
+
     instance = generate_network_design_instance(
         n_nodes=n_nodes,
         n_edges=n_edges,
@@ -150,7 +151,7 @@ def collect_for_seed(
             solver,
             [],
             lower_bound,
-            horizon=rollout_horizon,
+            horizon=effective_rollout_horizon,
             gamma=rollout_gamma,
             cut_penalty=cut_penalty,
             time_penalty_weight=time_penalty_weight,
@@ -169,7 +170,7 @@ def collect_for_seed(
                 solver, 
                 [cand], 
                 lower_bound, 
-                horizon=rollout_horizon, 
+                horizon=effective_rollout_horizon, 
                 gamma=rollout_gamma, 
                 cut_penalty=cut_penalty, 
                 time_penalty_weight=time_penalty_weight,
@@ -190,7 +191,7 @@ def collect_for_seed(
             solver,
             [cand for cand, _result in ranked_rollouts],
             lower_bound,
-            horizon=rollout_horizon,
+            horizon=effective_rollout_horizon,
             gamma=rollout_gamma,
             cut_penalty=cut_penalty,
             time_penalty_weight=time_penalty_weight,

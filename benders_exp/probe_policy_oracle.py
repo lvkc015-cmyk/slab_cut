@@ -41,6 +41,7 @@ def main() -> None:
 
     payload = load(args.model_path) if args.model_path is not None else None
     args.out.mkdir(parents=True, exist_ok=True)
+    effective_rollout_horizon = max(2, args.rollout_horizon)
     instance_kwargs = instance_generator_kwargs_from_args(args)
     instance = generate_network_design_instance(
         n_nodes=args.n_nodes,
@@ -114,7 +115,7 @@ def main() -> None:
             solver,
             [],
             lower_bound,
-            horizon=args.rollout_horizon,
+            horizon=effective_rollout_horizon,
             gamma=args.rollout_gamma,
             cut_penalty=args.cut_penalty,
             time_penalty_weight=args.time_penalty_weight,
@@ -132,7 +133,7 @@ def main() -> None:
                 solver,
                 [cand],
                 lower_bound,
-                horizon=args.rollout_horizon,
+                horizon=effective_rollout_horizon,
                 gamma=args.rollout_gamma,
                 cut_penalty=args.cut_penalty,
                 time_penalty_weight=args.time_penalty_weight,
@@ -150,7 +151,7 @@ def main() -> None:
             solver,
             ranked_candidates,
             lower_bound,
-            horizon=args.rollout_horizon,
+            horizon=effective_rollout_horizon,
             gamma=args.rollout_gamma,
             cut_penalty=args.cut_penalty,
             time_penalty_weight=args.time_penalty_weight,
@@ -175,7 +176,8 @@ def main() -> None:
             "iteration": it,
             "rel_gap": state.rel_gap,
             "pressure": state.pressure,
-            "candidate_count": len(viable),
+            "raw_candidate_count": len(candidates),
+            "viable_candidate_count": len(viable),
             "oracle_selected_count": len(oracle_selected),
             "oracle_best_prefix_size": best_prefix_size,
             "model_selected_count": len(model_selected),
@@ -229,6 +231,8 @@ def main() -> None:
                     cut_type=cand.cut_type,
                 )
             )
+        if state.rel_gap <= args.tol:
+            break
 
     csv_path = args.out / "probe_iterations.csv"
     if rows:
@@ -237,7 +241,8 @@ def main() -> None:
                 "iteration",
                 "rel_gap",
                 "pressure",
-                "candidate_count",
+                "raw_candidate_count",
+                "viable_candidate_count",
                 "oracle_selected_count",
                 "oracle_best_prefix_size",
                 "model_selected_count",
