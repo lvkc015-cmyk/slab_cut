@@ -82,6 +82,20 @@ def model_score_one(model: Any, features: list[float]) -> float:
     return float(model.predict([features])[0])
 
 
+def model_predict_scalar(model: Any, features: list[float], default: float = 0.0) -> float:
+    if model is None:
+        return default
+    if hasattr(model, "predict_proba"):
+        probs = model.predict_proba([features])
+        if len(probs) and len(probs[0]) > 1:
+            return float(probs[0][1])
+        if len(probs) and len(probs[0]) == 1:
+            return float(probs[0][0])
+    if hasattr(model, "predict"):
+        return float(model.predict([features])[0])
+    return default
+
+
 def candidate_priority(
     candidate: Any,
     candidates: list[Any],
@@ -153,6 +167,10 @@ def learned_candidate_selection(
     cache = state_cache(candidates, state)
     ranking_feature_names = payload.get("ranking_feature_names", POLICY_FEATURE_NAMES)
     stopping_feature_names = payload.get("stopping_feature_names", STOPPING_FEATURE_NAMES)
+    ranking_model = payload.get("ranking_model", payload.get("candidate_model"))
+    ranking_constant = payload.get("ranking_constant", None)
+    ranking_aux_model = payload.get("ranking_aux_model", None)
+    ranking_aux_constant = payload.get("ranking_aux_constant", None)
     # 从 payload 中读取多样性阈值和最大预算比例，
     diversity = float(payload["diversity_threshold"])
     max_ratio = float(payload["max_budget_ratio"])
@@ -177,8 +195,17 @@ def learned_candidate_selection(
             for name, value in zip(POLICY_FEATURE_NAMES, full_features)
         }
         features = [float(full_feature_map[name]) for name in ranking_feature_names]
-        # 使用 payload 中的模型对该割进行评分，得到一个分数 score
-        score = model_score_one(payload["candidate_model"], features)
+        primary_score = model_predict_scalar(
+            ranking_model,
+            features,
+            default=float(ranking_constant or 0.0),
+        )
+        aux_score = model_predict_scalar(
+            ranking_aux_model,
+            features,
+            default=float(ranking_aux_constant or 0.0),
+        )
+        score = primary_score + 1.0e-3 * aux_score
         # 将割、分数和特征映射组成一个元组，添加到 ranked_features 列表中。特征映射是一个字典，将特征名称与对应的特征值进行关联，供后续分析使用。
         feature_map = dict(full_feature_map)
         ranked_features.append((cand, score, feature_map))

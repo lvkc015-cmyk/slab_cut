@@ -14,7 +14,6 @@ STOPPING_META_FEATURE_NAMES = [
     "stop_prev_mean_score",
     "stop_prev_min_score",
     "stop_prev_max_score",
-    "stop_candidate_count",
 ]
 
 STOPPING_FEATURE_NAMES = [
@@ -22,6 +21,18 @@ STOPPING_FEATURE_NAMES = [
     *POLICY_FEATURE_NAMES,
     *STOPPING_META_FEATURE_NAMES,
 ]
+
+
+def _local_score_scale(
+    current_score: float,
+    next_score: float,
+    top_score: float,
+    processed_scores: list[float],
+) -> float:
+    scale = max(abs(current_score), abs(next_score), abs(top_score), 1.0e-6)
+    for score in processed_scores:
+        scale = max(scale, abs(score))
+    return scale
 
 
 def build_stopping_feature_dict(
@@ -46,6 +57,8 @@ def build_stopping_feature_dict(
         prev_mean = 0.0
         prev_min = 0.0
         prev_max = 0.0
+    score_scale = _local_score_scale(current_score, next_score, top_score, processed_scores)
+    safe_scale = max(score_scale, 1.0e-6)
     features = dict(state_features)
     features.update(candidate_features)
     features.update(
@@ -53,14 +66,13 @@ def build_stopping_feature_dict(
             "stop_rank_ratio": rank_index / total,
             "stop_prefix_ratio": prefix_count / total,
             "stop_selected_ratio": selected_count / total,
-            "stop_score": current_score,
-            "stop_next_score": next_score,
-            "stop_score_gap_next": current_score - next_score,
-            "stop_score_gap_top": top_score - current_score,
-            "stop_prev_mean_score": prev_mean,
-            "stop_prev_min_score": prev_min,
-            "stop_prev_max_score": prev_max,
-            "stop_candidate_count": float(total_candidates),
+            "stop_score": current_score / safe_scale,
+            "stop_next_score": next_score / safe_scale,
+            "stop_score_gap_next": (current_score - next_score) / safe_scale,
+            "stop_score_gap_top": (top_score - current_score) / safe_scale,
+            "stop_prev_mean_score": prev_mean / safe_scale,
+            "stop_prev_min_score": prev_min / safe_scale,
+            "stop_prev_max_score": prev_max / safe_scale,
         }
     )
     return features
